@@ -1,0 +1,150 @@
+name: Playwright 43644 native Windows reproduction
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Trials per runtime/load cell
+        required: true
+        default: '12'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: Firefox BiDi page.title reproduction
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      FIREFOX_VERSION: 158.0.1
+      RESULTS_ROOT: ${{ github.workspace }}\artifacts
+    steps:
+      - name: Check out the investigation branch
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+
+      - name: Record runner metadata
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:RESULTS_ROOT | Out-Null
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\runner.json"
+          node --version | Tee-Object -FilePath "$env:RESULTS_ROOT\node-version.txt"
+          npm --version | Tee-Object -FilePath "$env:RESULTS_ROOT\npm-version.txt"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\cpu.json"
+
+      - name: Download and verify official Firefox 158.0.1
+        shell: pwsh
+        run: |
+          $base = "https://ftp.mozilla.org/pub/firefox/releases/$env:FIREFOX_VERSION"
+          $installer = Join-Path $env:RUNNER_TEMP "Firefox Setup $env:FIREFOX_VERSION.exe"
+          $shaFile = Join-Path $env:RUNNER_TEMP 'SHA256SUMS'
+          $firefoxPath = Join-Path $env:RUNNER_TEMP 'Firefox158\firefox.exe'
+          Invoke-WebRequest "$base/SHA256SUMS" -OutFile $shaFile
+          Invoke-WebRequest "$base/win64/en-US/Firefox%20Setup%20$env:FIREFOX_VERSION.exe" -OutFile $installer
+          $line = Select-String -Path $shaFile -SimpleMatch "win64/en-US/Firefox Setup $env:FIREFOX_VERSION.exe" | Select-Object -First 1
+          if (-not $line) { throw 'Official Firefox checksum entry not found' }
+          $expected = ($line.Line -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          "expected=$expected`nactual=$actual`nmanifestLine=$($line.Line)" | Set-Content "$env:RESULTS_ROOT\firefox-sha256.txt"
+          if ($actual -ne $expected) { throw "Firefox SHA-256 mismatch: expected $expected, got $actual" }
+          & $installer /S "/InstallDirectoryPath=$($installer -replace '\\Firefox Setup .*$', '\Firefox158')"
+          if (-not (Test-Path $firefoxPath)) { throw 'Firefox executable missing after installation' }
+          "FIREFOX_PATH=$firefoxPath" | Set-Content "$env:RUNNER_TEMP\firefox-env.txt"
+          (Get-Item $firefoxPath).VersionInfo | Select-Object ProductVersion, FileVersion, OriginalFilename | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\firefox-version.json"
+          & $firefoxPath --version 2>&1 | Tee-Object -FilePath "$env:RESULTS_ROOT\firefox-version-command.txt"
+
+      - name: Run native reproduction matrix
+        shell: pwsh
+        env:
+          TRIALS: ${{ inputs.trials }}
+        run: |
+          $firefoxEnv = Get-Content "$env:RUNNER_TEMP\firefox-env.txt" | ConvertFrom-StringData
+          $env:FIREFOX_PATH = $firefoxEnv.FIREFOX_PATH
+          $versions = @('1.62.0', '1.65.0-alpha-2026-10-26')
+          $pressures = @(0, 3)
+          foreach ($version in $versions) {
+            $safeVersion = $version -replace '[^0-9A-Za-z.-]', '_'
+            $installRoot = Join-Path $env:RUNNER_TEMP "pw43644-$safeVersion"
+            npm install --prefix $installRoot --package-lock=false --no-save --ignore-scripts --no-audit --no-fund "playwright-core@$version"
+            $installed = Get-Content (Join-Path $installRoot 'node_modules\playwright-core\package.json') | ConvertFrom-Json
+            if ($installed.version -ne $version) { throw "Installed $($installed.version), expected $version" }
+            npm view "playwright-core@$version" version dist.tarball gitHead --json | Set-Content "$env:RESULTS_ROOT\npm-$safeVersion.json"
+            $env:PLAYWRIGHT_CORE_ROOT = Join-Path $installRoot 'node_modules\playwright-core'
+            foreach ($pressure in $pressures) {
+              $cell = "$safeVersion-pressure$pressure"
+              $env:PRESSURE_THREADS = "$pressure"
+              $env:PROFILE_ROOT = Join-Path $env:RUNNER_TEMP "profiles-$cell"
+              $env:RESULTS_PATH = Join-Path $env:RESULTS_ROOT "$cell.jsonl"
+              $env:DEBUG = 'pw:browser,pw:protocol'
+              $tracePath = Join-Path $env:RESULTS_ROOT "$cell-process-trace.jsonl"
+              $sampler = Start-Job -ArgumentList $tracePath -ScriptBlock {
+                param($path)
+                while ($true) {
+                  $processes = Get-Process firefox,node -ErrorAction SilentlyContinue | Select-Object ProcessName,Id,CPU,WorkingSet64
+                  [ordered]@{ timestamp = (Get-Date).ToUniversalTime().ToString('o'); processes = @($processes) } | ConvertTo-Json -Compress | Add-Content $path
+                  Start-Sleep -Seconds 1
+                }
+              }
+              try {
+                node .github/repro-43644/repro-windows.mjs *>&1 | Tee-Object -FilePath (Join-Path $env:RESULTS_ROOT "$cell.log")
+                if ($LASTEXITCODE -ne 0) { throw "Harness crashed in $cell" }
+              } finally {
+                Stop-Job $sampler -ErrorAction SilentlyContinue
+                Receive-Job $sampler -ErrorAction SilentlyContinue | Out-Null
+                Remove-Job $sampler -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+      - name: Capture focused WebDriver BiDi traces
+        shell: pwsh
+        run: |
+          $firefoxEnv = Get-Content "$env:RUNNER_TEMP\firefox-env.txt" | ConvertFrom-StringData
+          $env:FIREFOX_PATH = $firefoxEnv.FIREFOX_PATH
+          foreach ($version in @('1.62.0', '1.65.0-alpha-2026-10-26')) {
+            $safeVersion = $version -replace '[^0-9A-Za-z.-]', '_'
+            $installRoot = Join-Path $env:RUNNER_TEMP "pw43644-$safeVersion"
+            $env:PLAYWRIGHT_CORE_ROOT = Join-Path $installRoot 'node_modules\playwright-core'
+            $env:TRIALS = '1'
+            $env:PRESSURE_THREADS = '3'
+            $env:PROFILE_ROOT = Join-Path $env:RUNNER_TEMP "trace-profile-$safeVersion"
+            $env:RESULTS_PATH = Join-Path $env:RESULTS_ROOT "trace-$safeVersion.jsonl"
+            $env:DEBUG = 'pw:browser,pw:protocol'
+            node .github/repro-43644/repro-windows.mjs *>&1 | Tee-Object -FilePath (Join-Path $env:RESULTS_ROOT "trace-$safeVersion.log")
+            if ($LASTEXITCODE -ne 0) { throw "Trace harness crashed for $version" }
+          }
+
+      - name: Produce classification summary
+        if: always()
+        shell: pwsh
+        run: |
+          $records = Get-ChildItem "$env:RESULTS_ROOT\*.jsonl" | ForEach-Object { Get-Content $_ | ForEach-Object { $_ | ConvertFrom-Json } }
+          $trials = @($records | Where-Object type -eq 'trial')
+          $titleFailures = @($trials | Where-Object status -eq 'title-failure').Count
+          $summary = [ordered]@{
+            trials = $trials.Count
+            passed = @($trials | Where-Object status -eq 'passed').Count
+            titleFailures = $titleFailures
+            browserLaunchFailures = @($trials | Where-Object status -eq 'browser-launch-failure').Count
+            timeoutFailures = @($trials | Where-Object status -eq 'timeout-failure').Count
+            infrastructureFailures = @($trials | Where-Object status -eq 'infrastructure-failure').Count
+            firstTitleEmpty = @($trials | Where-Object first -eq '').Count
+            secondTitleExpected = @($trials | Where-Object { $_.second -eq $_.expected }).Count
+            classification = if ($titleFailures) { 'NATIVE UPSTREAM REPRODUCTION OBTAINED' } else { 'UNVERIFIED UPSTREAM DEFECT' }
+          }
+          $summary | ConvertTo-Json | Tee-Object -FilePath "$env:RESULTS_ROOT\classification.json"
+
+      - name: Upload bounded evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-43644-windows-evidence
+          path: artifacts
+          retention-days: 7
+          compression-level: 9
+          if-no-files-found: error
