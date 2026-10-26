@@ -77,7 +77,7 @@ jobs:
           if ($installProcess.ExitCode -ne 0) { throw "Firefox installer failed with exit code $($installProcess.ExitCode)" }
           if (-not $candidates) { throw "Firefox executable missing after installation in $installRoot and known fallback paths" }
           $firefoxPath = $candidates[0]
-          "FIREFOX_PATH=$firefoxPath" | Set-Content "$env:RUNNER_TEMP\firefox-env.txt"
+          Add-Content -Path $env:GITHUB_ENV -Value "FIREFOX_PATH=$firefoxPath"
           (Get-Item $firefoxPath).VersionInfo | Select-Object ProductVersion, FileVersion, OriginalFilename | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\firefox-version.json"
           & $firefoxPath --version 2>&1 | Tee-Object -FilePath "$env:RESULTS_ROOT\firefox-version-command.txt"
 
@@ -86,8 +86,8 @@ jobs:
         env:
           TRIALS: ${{ inputs.trials }}
         run: |
-          $firefoxEnv = Get-Content "$env:RUNNER_TEMP\firefox-env.txt" | ConvertFrom-StringData
-          $env:FIREFOX_PATH = $firefoxEnv.FIREFOX_PATH
+          if (-not $env:FIREFOX_PATH) { throw 'FIREFOX_PATH was not exported by the Firefox installation step' }
+          if (-not (Test-Path -LiteralPath $env:FIREFOX_PATH -PathType Leaf)) { throw "Firefox executable missing at $env:FIREFOX_PATH" }
           $versions = @('1.62.0', '1.65.0-alpha-2026-10-26')
           $pressures = @(0, 3)
           foreach ($version in $versions) {
@@ -127,8 +127,8 @@ jobs:
       - name: Capture focused WebDriver BiDi traces
         shell: pwsh
         run: |
-          $firefoxEnv = Get-Content "$env:RUNNER_TEMP\firefox-env.txt" | ConvertFrom-StringData
-          $env:FIREFOX_PATH = $firefoxEnv.FIREFOX_PATH
+          if (-not $env:FIREFOX_PATH) { throw 'FIREFOX_PATH was not exported by the Firefox installation step' }
+          if (-not (Test-Path -LiteralPath $env:FIREFOX_PATH -PathType Leaf)) { throw "Firefox executable missing at $env:FIREFOX_PATH" }
           foreach ($version in @('1.62.0', '1.65.0-alpha-2026-10-26')) {
             $safeVersion = $version -replace '[^0-9A-Za-z.-]', '_'
             $installRoot = Join-Path $env:RUNNER_TEMP "pw43644-$safeVersion"
