@@ -43,7 +43,8 @@ jobs:
           $base = "https://ftp.mozilla.org/pub/firefox/releases/$env:FIREFOX_VERSION"
           $installer = Join-Path $env:RUNNER_TEMP "Firefox Setup $env:FIREFOX_VERSION.exe"
           $shaFile = Join-Path $env:RUNNER_TEMP 'SHA256SUMS'
-          $firefoxPath = Join-Path $env:RUNNER_TEMP 'Firefox158\firefox.exe'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'Firefox158'
+          $firefoxPath = Join-Path $installRoot 'firefox.exe'
           Invoke-WebRequest "$base/SHA256SUMS" -OutFile $shaFile
           Invoke-WebRequest "$base/win64/en-US/Firefox%20Setup%20$env:FIREFOX_VERSION.exe" -OutFile $installer
           $line = Select-String -Path $shaFile -SimpleMatch "win64/en-US/Firefox Setup $env:FIREFOX_VERSION.exe" | Select-Object -First 1
@@ -52,8 +53,30 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
           "expected=$expected`nactual=$actual`nmanifestLine=$($line.Line)" | Set-Content "$env:RESULTS_ROOT\firefox-sha256.txt"
           if ($actual -ne $expected) { throw "Firefox SHA-256 mismatch: expected $expected, got $actual" }
-          & $installer /S "/InstallDirectoryPath=$($installer -replace '\\Firefox Setup .*$', '\Firefox158')"
-          if (-not (Test-Path $firefoxPath)) { throw 'Firefox executable missing after installation' }
+          if (Test-Path $installRoot) { Remove-Item -Recurse -Force $installRoot }
+          $installArgs = @(
+            '/S',
+            "/InstallDirectoryPath=`"$installRoot`"",
+            '/MaintenanceService=false',
+            '/DesktopShortcut=false',
+            '/StartMenuShortcut=false'
+          )
+          $installProcess = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
+          $candidates = @(
+            $firefoxPath,
+            (Join-Path $env:ProgramFiles 'Mozilla Firefox\firefox.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Mozilla Firefox\firefox.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Mozilla Firefox\firefox.exe')
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          [ordered]@{
+            installer = $installer
+            requestedInstallRoot = $installRoot
+            installerExitCode = $installProcess.ExitCode
+            candidates = @($candidates)
+          } | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\firefox-install.json"
+          if ($installProcess.ExitCode -ne 0) { throw "Firefox installer failed with exit code $($installProcess.ExitCode)" }
+          if (-not $candidates) { throw "Firefox executable missing after installation in $installRoot and known fallback paths" }
+          $firefoxPath = $candidates[0]
           "FIREFOX_PATH=$firefoxPath" | Set-Content "$env:RUNNER_TEMP\firefox-env.txt"
           (Get-Item $firefoxPath).VersionInfo | Select-Object ProductVersion, FileVersion, OriginalFilename | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\firefox-version.json"
           & $firefoxPath --version 2>&1 | Tee-Object -FilePath "$env:RESULTS_ROOT\firefox-version-command.txt"
