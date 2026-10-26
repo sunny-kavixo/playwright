@@ -81,6 +81,27 @@ jobs:
           (Get-Item $firefoxPath).VersionInfo | Select-Object ProductVersion, FileVersion, OriginalFilename | ConvertTo-Json | Set-Content "$env:RESULTS_ROOT\firefox-version.json"
           & $firefoxPath --version 2>&1 | Tee-Object -FilePath "$env:RESULTS_ROOT\firefox-version-command.txt"
 
+      - name: Run single-browser smoke test
+        shell: pwsh
+        run: |
+          if (-not $env:FIREFOX_PATH) { throw 'FIREFOX_PATH was not exported by the Firefox installation step' }
+          if (-not (Test-Path -LiteralPath $env:FIREFOX_PATH -PathType Leaf)) { throw "Firefox executable missing at $env:FIREFOX_PATH" }
+          $version = '1.62.0'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'pw43644-smoke'
+          npm install --prefix $installRoot --package-lock=false --no-save --ignore-scripts --no-audit --no-fund "playwright-core@$version"
+          $installed = Get-Content (Join-Path $installRoot 'node_modules\playwright-core\package.json') | ConvertFrom-Json
+          if ($installed.version -ne $version) { throw "Installed $($installed.version), expected $version" }
+          $env:PLAYWRIGHT_CORE_ROOT = Join-Path $installRoot 'node_modules\playwright-core'
+          $env:TRIALS = '1'
+          $env:PRESSURE_THREADS = '0'
+          $env:PROFILE_ROOT = Join-Path $env:RUNNER_TEMP 'profiles-smoke'
+          $env:RESULTS_PATH = Join-Path $env:RESULTS_ROOT 'smoke.jsonl'
+          $env:DEBUG = 'pw:browser,pw:protocol'
+          $smokeLog = Join-Path $env:RESULTS_ROOT 'smoke.log'
+          node .github/repro-43644/repro-windows.mjs *>&1 | Tee-Object -FilePath $smokeLog
+          if ($LASTEXITCODE -ne 0) { throw 'Single-browser smoke test failed' }
+          if (-not (Select-String -Path $smokeLog -SimpleMatch 'WebDriver BiDi listening')) { throw 'Single-browser smoke test did not observe a WebDriver BiDi endpoint' }
+
       - name: Run native reproduction matrix
         shell: pwsh
         env:

@@ -11,6 +11,7 @@ const pressureThreads = Number(process.env.PRESSURE_THREADS || 0);
 const profileRoot = process.env.PROFILE_ROOT || await fs.mkdtemp(path.join(os.tmpdir(), 'pw43644-'));
 const resultsPath = process.env.RESULTS_PATH;
 const timeoutMs = Number(process.env.TRIAL_TIMEOUT_MS || 30_000);
+const firefoxChannel = 'moz-firefox';
 
 if (!playwrightRoot)
   throw new Error('PLAYWRIGHT_CORE_ROOT is required');
@@ -20,7 +21,9 @@ if (!resultsPath)
   throw new Error('RESULTS_PATH is required');
 
 const playwrightPackage = JSON.parse(await fs.readFile(path.join(playwrightRoot, 'package.json'), 'utf8'));
-const { firefox } = await import(pathToFileURL(path.join(playwrightRoot, 'index.js')).href);
+const playwrightModule = await import(pathToFileURL(path.join(playwrightRoot, 'index.js')).href);
+const playwright = playwrightModule.default ?? playwrightModule;
+const firefox = playwright.firefox;
 const workers = [];
 
 await fs.mkdir(path.dirname(resultsPath), { recursive: true });
@@ -41,9 +44,22 @@ async function append(record) {
   process.stdout.write(`${JSON.stringify(record)}\n`);
 }
 
+if (!firefox || typeof firefox.launch !== 'function' || typeof firefox.launchPersistentContext !== 'function')
+  throw new Error('playwright-core preflight failed: expected firefox.launch and firefox.launchPersistentContext');
+
+await append({
+  type: 'preflight',
+  playwrightVersion: playwrightPackage.version,
+  launcher: 'firefox',
+  launch: 'function',
+  launchPersistentContext: 'function',
+  channel: firefoxChannel,
+  backend: 'webdriver-bidi',
+});
+
 async function launch(profile) {
   return firefox.launchPersistentContext(profile, {
-    channel: 'moz-firefox',
+    channel: firefoxChannel,
     executablePath,
     headless: true,
     timeout: timeoutMs,
@@ -136,7 +152,7 @@ try {
 
 const lines = (await fs.readFile(resultsPath, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
 const trialRecords = lines.filter(record => record.type === 'trial');
-await append({
+const summary = {
   type: 'summary',
   playwrightVersion: playwrightPackage.version,
   node: process.version,
@@ -152,4 +168,8 @@ await append({
   firstTitleEmpty: trialRecords.filter(record => record.first === '').length,
   secondTitleExpected: trialRecords.filter(record => record.second === record.expected).length,
   profileRoot,
-});
+};
+await append(summary);
+
+if (summary.browserLaunchFailures > 0)
+  process.exitCode = 1;
