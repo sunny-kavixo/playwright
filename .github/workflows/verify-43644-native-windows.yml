@@ -7,6 +7,11 @@ on:
         description: Trials per runtime/load cell
         required: true
         default: '12'
+      run_matrix:
+        description: Run the bounded matrix and focused traces after smoke
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -103,6 +108,7 @@ jobs:
           if (-not (Select-String -Path $smokeLog -SimpleMatch 'WebDriver BiDi listening')) { throw 'Single-browser smoke test did not observe a WebDriver BiDi endpoint' }
 
       - name: Run native reproduction matrix
+        if: inputs.run_matrix
         shell: pwsh
         env:
           TRIALS: ${{ inputs.trials }}
@@ -146,6 +152,7 @@ jobs:
           }
 
       - name: Capture focused WebDriver BiDi traces
+        if: inputs.run_matrix
         shell: pwsh
         run: |
           if (-not $env:FIREFOX_PATH) { throw 'FIREFOX_PATH was not exported by the Firefox installation step' }
